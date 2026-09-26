@@ -1,0 +1,20 @@
+theme = light:Tomorrow,dark:Tomorrow Night
+
+shell-integration-features = no-cursor,sudo
+
+bell-features = system
+
+macos-titlebar-style = tabs
+macos-window-buttons = hidden
+
+window-width = 140
+window-height = 40
+window-padding-x = 8
+
+background-blur = macos-glass-clear
+
+window-inherit-working-directory = false
+
+cursor-style = block
+
+scrollback-limit = 100000000

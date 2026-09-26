@@ -1,0 +1,25 @@
+[user]
+	name = Christopher Fuller
+	email = 327249495+lib-cf@users.noreply.github.com
+[init]
+	defaultBranch = main
+[fetch]
+	prune = true
+[pull]
+	rebase = true
+[push]
+	autoSetupRemote = true
+[diff]
+	tool = Kaleidoscope
+[difftool "Kaleidoscope"]
+	cmd = ksdiff --partial-changeset --relative-path \"$MERGED\" -- \"$LOCAL\" \"$REMOTE\"
+[difftool]
+	prompt = false
+	trustExitCode = true
+[merge]
+	tool = Kaleidoscope
+[mergetool "Kaleidoscope"]
+	cmd = ksdiff --merge --output \"$MERGED\" --base \"$BASE\" -- \"$LOCAL\" --snapshot \"$REMOTE\" --snapshot
+	trustExitCode = true
+[mergetool]
+	prompt = false
