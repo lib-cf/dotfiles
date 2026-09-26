@@ -1,0 +1,42 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+has_swift_package_manifest=false
+
+for arg in "$@"
+do
+  if [ "${arg##*/}" = "Package.swift" ]
+  then
+    has_swift_package_manifest=true
+    break
+  fi
+done
+
+if [ "$has_swift_package_manifest" = true ]
+then
+  printf '%s\n\n' "The arguments include a Swift package manifest:"
+
+  for arg in "$@"
+  do
+    if [ "${arg##*/}" = "Package.swift" ]
+    then
+      printf '%s %s\n' '->' "$arg"
+    else
+      printf '   %s\n' "$arg"
+    fi
+  done
+
+  printf '\nOpen with Xcode? [y/N] '
+  read -r answer
+
+  case "$answer" in
+    [yY]|[yY][eE][sS])
+      ;;
+    *)
+      exit 1
+      ;;
+  esac
+fi
+
+exec "$(xcode-select -p)/usr/bin/xed" "$@"

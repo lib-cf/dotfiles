@@ -1,0 +1,12 @@
+brew "eza"
+brew "gh"
+brew "gum"
+brew "mint"
+brew "nano"
+brew "prettier"
+brew "spaceship"
+brew "vivid"
+brew "zsh-autosuggestions"
+brew "zsh-syntax-highlighting"
+
+cask "copilot-cli"

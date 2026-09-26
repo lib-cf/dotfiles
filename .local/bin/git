@@ -1,0 +1,9 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+# This shim invokes Git directly from the active Xcode developer directory,
+# avoiding delays in displaying the initial shell prompt caused by macOS's
+# reliance on `xcrun` when invoking Git via `/usr/bin/git`.
+
+exec "$(xcode-select -p)/usr/bin/git" "$@"

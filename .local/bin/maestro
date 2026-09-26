@@ -1,0 +1,9 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+exec env \
+  MAESTRO_CLI_NO_ANALYTICS="true" \
+  MAESTRO_OPTS="--enable-final-field-mutation=ALL-UNNAMED" \
+  JAVA_OPTS="--sun-misc-unsafe-memory-access=allow" \
+  /opt/homebrew/bin/maestro "$@"

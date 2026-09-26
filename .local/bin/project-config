@@ -1,0 +1,63 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+rm -rf .claude
+
+mkdir -p .claude/rules
+
+cat > .claude/rules/git-guidelines.md <<'EOF'
+# Git Guidelines
+
+Do not inspect git history, such as `git log` or `git blame`, by default. Use git history only when a task requires
+historical context, such as investigating a regression or understanding why an unusual implementation exists.
+EOF
+
+cat > .claude/rules/shell-environment.md <<'EOF'
+# Shell Environment
+
+All shell commands must use Zsh-compatible syntax and must not rely on Bash-specific syntax or behavior. For example,
+quote glob patterns passed as arguments (e.g. `--include='*.swift'`), because with Zsh's `nomatch` option on, a glob
+that matches no files causes an error instead of being passed through.
+EOF
+
+touch .claude/CLAUDE.md
+
+cat > .claude/settings.json <<'EOF'
+{
+  "autoMemoryEnabled": false,
+  "enabledPlugins": {
+    "swift-lsp@claude-plugins-official": true
+  }
+}
+EOF
+
+cat > .claude/settings.local.json <<'EOF'
+{
+  "sandbox": {
+    "enabled": false
+  }
+}
+EOF
+
+[[ -d .git ]] && [[ ! -e .git/hooks/commit-msg ]] &&
+  ln -s ~/.config/git/hooks/commit-msg .git/hooks/commit-msg
+
+cat > .gitignore <<'EOF'
+# macOS
+.DS_Store
+
+# Claude
+**/.claude/.cc-writes/
+**/.claude/settings.local.json
+
+# SPM
+.swiftpm/
+.build/
+
+# Xcode
+*.xcworkspace/
+*.xcodeproj/
+EOF
+
+touch README.md

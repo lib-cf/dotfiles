@@ -1,0 +1,8 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+exec env \
+  TERM_PROGRAM="Apple_Terminal" \
+  TERM="xterm-256color" \
+  /opt/homebrew/bin/gum "$@"

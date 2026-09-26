@@ -1,0 +1,7 @@
+#include "/opt/homebrew/share/nano/*.nanorc"
+
+set autoindent
+set minibar
+set smarthome
+set tabsize 4
+set tabstospaces

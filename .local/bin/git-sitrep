@@ -1,0 +1,562 @@
+#!/usr/bin/env zsh
+
+# Usage: git sitrep [-v|--verbose] [-j|--jobs <n>] <repo-path> [<repo-path> ...]
+#
+# Reports the state of several Git working trees at once: the branch, how it compares with its upstream, uncommitted
+# changes and stashes. Each repo is fetched first, so the comparison reflects the remote, and repos are checked in
+# parallel. Results are printed in the order the paths were given, as a compact table by default or as a section per
+# repo with -v. The exit status is 1 if any repo couldn't be fully checked.
+
+set -euo pipefail
+
+prog="${0:t}"
+
+# zparseopts -F, which rejects unknown options, was added in Zsh 5.8
+autoload -Uz is-at-least
+if ! is-at-least 5.8
+then
+  print -u2 -r -- "${prog}: requires Zsh v5.8 or later, found ${ZSH_VERSION}"
+  exit 1
+fi
+
+# Options
+
+usage="Usage: git sitrep [-v|--verbose] [-j|--jobs <n>] <repo-path> [<repo-path> ...]"
+
+# An empty message prints just the blank line, to separate the usage from an error zparseopts has already printed
+usage_error() {
+  if (( $# ))
+  then
+    [[ -n "$1" ]] && print -u2 -r -- "${prog}: ${1}"
+    print -u2
+  fi
+  print -u2 -r -- "$usage"
+  exit 1
+}
+
+typeset -a opt_verbose=() opt_jobs=()
+
+zparseopts -D -F -- v=opt_verbose -verbose=opt_verbose j:=opt_jobs -jobs:=opt_jobs || usage_error ''
+
+typeset -i verbose="${#opt_verbose}"
+
+max_jobs=4
+
+if (( ${#opt_jobs} ))
+then
+  # The last -j wins. With --jobs=<n>, zparseopts keeps the "=" as part of the value.
+  max_jobs="${opt_jobs[-1]#=}"
+  [[ "$max_jobs" != <1-> ]] && usage_error "jobs must be a positive integer: ${max_jobs}"
+fi
+
+(( $# == 0 )) && usage_error
+
+# Setup
+
+typeset -a repos=()
+typeset -A seen_repos=()
+
+# A repo given more than once, including through a symlink or a different relative path, is checked once. The path
+# is kept as given, as that's what the user will recognise in the output.
+for repo in "$@"
+do
+  [[ -n "${seen_repos[${repo:A}]-}" ]] && continue
+  seen_repos[${repo:A}]=1
+  repos+=("$repo")
+done
+
+# Running more jobs than repos would be pointless, so max_jobs is capped at the repo count. A huge -j value could
+# overflow Zsh's integers, so after stripping leading zeros, the number of digits is compared first and the values
+# only if that doesn't settle it.
+max_jobs="${max_jobs#"${max_jobs%%[1-9]*}"}"
+(( ${#max_jobs} > ${#${#repos}} || max_jobs > ${#repos} )) && max_jobs="${#repos}"
+
+c_head= c_ok= c_warn= c_err= c_off=
+
+if [[ -t 1 && -z "${NO_COLOR-}" ]]
+then
+  autoload -Uz colors && colors
+  c_head="${fg_bold[blue]}" c_ok="${fg[green]}" c_warn="${fg[yellow]}" c_err="${fg[red]}" c_off="$reset_color"
+fi
+
+# The progress line is written to stderr, as Git does with its own progress, so it still appears when the results are
+# redirected. A dumb terminal can't clear a line to redraw it.
+typeset -i progress=0
+[[ -t 2 && "${TERM-}" != dumb ]] && progress=1
+
+# Dim, rather than one of the result colors, so it doesn't look like part of the results
+c_progress= c_progress_off=
+[[ -z "${NO_COLOR-}" ]] && c_progress=$'\e[2m' c_progress_off=$'\e[0m'
+
+# A remote that needs HTTPS credentials makes the fetch fail rather than wait for a prompt nobody can see
+export GIT_TERMINAL_PROMPT=0
+
+# pids holds each repo's background job, by its position in repos. The row_* arrays build up the compact table.
+typeset -a pids=() row_repos=() row_branches=() row_branch_colors=() row_statuses=()
+typeset -i finished=0 exit_code=0
+
+# Collection
+
+# Prints the SSH command Git would use for <repo>. Git takes the first of GIT_SSH_COMMAND, core.sshCommand and
+# GIT_SSH that's set, falling back to ssh. The fetch adds an option by setting GIT_SSH_COMMAND, which would override
+# the others, so it has to start from whichever one Git would otherwise have used.
+ssh_command() {
+  local cmd
+
+  if [[ -n "${GIT_SSH_COMMAND-}" ]]
+  then
+    print -r -- "$GIT_SSH_COMMAND"
+  elif cmd="$(git -C "$1" config --get core.sshCommand)" && [[ -n "$cmd" ]]
+  then
+    print -r -- "$cmd"
+  elif [[ -n "${GIT_SSH-}" ]]
+  then
+    # GIT_SSH names a program, while GIT_SSH_COMMAND is run by a shell, so a path with spaces needs quoting
+    print -r -- "${(qq)GIT_SSH}"
+  else
+    print ssh
+  fi
+}
+
+# Checks <repo> and prints the results as a `typeset -p` of the associative array r, for the main script to source.
+# Runs as a background job, so this is how its results get back. Returns 1 if the fetch or status failed.
+collect_repo() {
+  local repo="$1" out line xy
+  local -a counts stashes status_cmd
+  local -A r=(repo "$repo" name "${${repo:a}:t}")
+
+  if [[ "$(git -C "$repo" rev-parse --is-inside-work-tree 2>/dev/null)" != true ]]
+  then
+    r[work_tree]=0
+    typeset -p r
+    return 1
+  fi
+
+  r[work_tree]=1
+
+  r[fetch]=none
+  if [[ -n "$(git -C "$repo" remote)" ]]
+  then
+    # BatchMode makes SSH fail rather than prompt for a password, passphrase or unknown host key, which would hang
+    if out="$(GIT_SSH_COMMAND="$(ssh_command "$repo") -o BatchMode=yes" git -C "$repo" fetch --all --prune --quiet 2>&1)"
+    then
+      r[fetch]=ok
+    else
+      r[fetch]=failed r[fetch_err]="$out"
+    fi
+  fi
+
+  # The full ref, shortened here, as symbolic-ref --short gives heads/<branch> when a tag has the same name
+  if out="$(git -C "$repo" symbolic-ref -q HEAD)"
+  then
+    r[branch]="${out#refs/heads/}"
+  else
+    # A tag at HEAD, such as a checked-out release, says more than the commit hash
+    r[branch]= r[head]="$(git -C "$repo" describe --tags --exact-match HEAD 2>/dev/null ||
+      git -C "$repo" rev-parse --short HEAD 2>/dev/null || print unknown)"
+  fi
+
+  # sync is one of: detached; tracking, with ahead and behind counts; gone, when the branch is configured with an
+  # upstream that no longer exists, such as one deleted on the remote and pruned; or none, with no upstream configured
+  if [[ -z "${r[branch]}" ]]
+  then
+    r[sync]=detached
+  elif out="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"
+  then
+    # rev-list prints the behind and ahead counts on one line. Unquoted, so (z) splits them into separate elements.
+    counts=(${(z)"$(git -C "$repo" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null || true)"})
+    r[sync]=tracking r[upstream]="$out" r[behind]="${counts[1]:-0}" r[ahead]="${counts[2]:-0}"
+  elif git -C "$repo" config --get "branch.${r[branch]}.merge" &>/dev/null
+  then
+    r[sync]=gone
+  else
+    r[sync]=none
+  fi
+
+  # By default, status refreshes the index, which takes index.lock. --no-optional-locks avoids that, as a git
+  # command the user runs in the same repo at that moment would fail on the lock.
+  status_cmd=(git -C "$repo" --no-optional-locks status --porcelain --untracked-files=all)
+
+  # stderr is kept out of the output, so any warnings aren't counted as entries
+  if out="$("${status_cmd[@]}" 2>/dev/null)"
+  then
+    local -i staged=0 unstaged=0 untracked=0 conflicts=0
+    # Each line starts with a two-letter XY code, for the index and the working tree. Unquoted, so (f) splits the
+    # output into lines and empty output gives no iterations.
+    for line in ${(f)out}
+    do
+      xy="${line[1,2]}"
+      case $xy in
+        '??')                         (( ++untracked )) ;;
+        DD|AU|UD|UA|DU|AA|UU)         (( ++conflicts )) ;;
+        *)
+          [[ "${xy[1]}" != ' ' ]] && (( ++staged ))
+          [[ "${xy[2]}" != ' ' ]] && (( ++unstaged ))
+          ;;
+      esac
+    done
+    r[status]=ok r[staged]="$staged" r[unstaged]="$unstaged" r[untracked]="$untracked" r[conflicts]="$conflicts"
+  else
+    r[status]=failed
+    # stderr was discarded above, so status runs again to capture the error. If it succeeds this time, the failure
+    # was transient, and what it printed to stderr would be warnings, not the cause.
+    if r[status_err]="$("${status_cmd[@]}" 2>&1 >/dev/null)"
+    then
+      r[status_err]="may be a temporary issue, please try again"
+    fi
+  fi
+
+  out="$(git -C "$repo" stash list 2>/dev/null)" || out=
+  # Unquoted, so (f) splits the output into lines and empty output gives an empty array
+  stashes=(${(f)out})
+  r[stashes]="${#stashes}"
+
+  typeset -p r
+
+  [[ "${r[fetch]}" != failed && "${r[status]}" != failed ]]
+}
+
+# Rendering
+#
+# Both renderers read the r of the repo being reported. It's declared local in finish_next, which calls them, and
+# Zsh's dynamic scoping makes it visible to them. A missing work_tree means collect_repo died before printing r.
+
+# When the fetch failed, the upstream comparison is marked stale, as it's based on whatever was last fetched
+render_verbose() {
+  local stale= parts=()
+
+  print
+  print -r -- "${c_head}→ ${r[repo]}${c_off}"
+  print
+
+  if [[ -z "${r[work_tree]-}" ]]
+  then
+    print "  ${c_err}Check failed${c_off}"
+    return
+  fi
+
+  if (( ! r[work_tree] ))
+  then
+    print "  ${c_err}Not a git working tree${c_off}"
+    return
+  fi
+
+  if [[ "${r[fetch]}" == failed ]]
+  then
+    print -r -- "  ${c_err}Fetch failed:${c_off} ${r[fetch_err]//$'\n'/ }"
+    stale=" ${c_warn}(stale: fetch failed)${c_off}"
+  fi
+
+  if [[ -n "${r[branch]}" ]]
+  then
+    print -r -- "  Branch:   ${r[branch]}"
+  else
+    print -r -- "  Branch:   ${c_warn}(detached at ${r[head]})${c_off}"
+  fi
+
+  case ${r[sync]} in
+    detached)
+      print "  Upstream: ${c_warn}n/a (detached HEAD)${c_off}"
+      ;;
+    tracking)
+      if (( r[ahead] && r[behind] ))
+      then
+        print -r -- "  Upstream: ${c_err}needs pull and push${c_off} (${r[behind]} behind, ${r[ahead]} ahead of ${r[upstream]})${stale}"
+      elif (( r[behind] ))
+      then
+        print -r -- "  Upstream: ${c_warn}needs pull${c_off} (${r[behind]} behind ${r[upstream]})${stale}"
+      elif (( r[ahead] ))
+      then
+        print -r -- "  Upstream: ${c_warn}needs push${c_off} (${r[ahead]} ahead of ${r[upstream]})${stale}"
+      elif [[ -n "$stale" ]]
+      then
+        print -r -- "  Upstream: ${c_warn}up to date${c_off} with ${r[upstream]}${stale}"
+      else
+        print -r -- "  Upstream: ${c_ok}up to date${c_off} with ${r[upstream]}"
+      fi
+      ;;
+    gone)
+      print -r -- "  Upstream: ${c_err}gone${c_off}${stale}"
+      ;;
+    none)
+      print "  Upstream: ${c_warn}none${c_off}"
+      ;;
+  esac
+
+  if [[ "${r[status]}" == failed ]]
+  then
+    print -r -- "  Status:   ${c_err}failed:${c_off} ${r[status_err]//$'\n'/ }"
+  elif (( r[staged] + r[unstaged] + r[untracked] + r[conflicts] == 0 ))
+  then
+    print "  Status:   ${c_ok}clean${c_off}"
+  else
+    (( r[conflicts] )) && parts+=("${r[conflicts]} conflicted")
+    (( r[staged] ))    && parts+=("${r[staged]} staged")
+    (( r[unstaged] ))  && parts+=("${r[unstaged]} unstaged")
+    (( r[untracked] )) && parts+=("${r[untracked]} untracked")
+    print "  Status:   ${c_warn}${(j:, :)parts}${c_off}"
+  fi
+
+  if (( r[stashes] > 0 ))
+  then
+    print "  Stashes:  ${c_warn}${r[stashes]}${c_off}"
+  else
+    print "  Stashes:  0"
+  fi
+}
+
+# Adds the repo as a row of the compact table, which is printed once every repo is done, so the columns can be sized
+# to fit. The status column is a list of marks: ~ fetch failed, - no upstream, ✗ upstream gone, ≡ up to date,
+# ↓ behind, ↑ ahead, ! conflicts, + staged, * unstaged, ? untracked and $ stashes. A detached HEAD shows as @<tag>
+# or @<commit> in place of the branch. @ is Git's shorthand for HEAD, and is more compact than verbose mode's
+# (detached at <commit>), which keeps the branch column narrow.
+render_compact() {
+  local sync marks=()
+
+  row_repos+=("${r[name]}")
+
+  if [[ -z "${r[work_tree]-}" ]]
+  then
+    row_branches+=("") row_branch_colors+=("")
+    row_statuses+=("${c_err}(check failed)${c_off}")
+    return
+  fi
+
+  if (( ! r[work_tree] ))
+  then
+    row_branches+=("") row_branch_colors+=("")
+    row_statuses+=("${c_err}(not a work tree)${c_off}")
+    return
+  fi
+
+  [[ "${r[fetch]}" == failed ]] && marks+=("${c_err}~${c_off}")
+
+  if [[ -n "${r[branch]}" ]]
+  then
+    row_branches+=("${r[branch]}") row_branch_colors+=("")
+  else
+    row_branches+=("@${r[head]}") row_branch_colors+=("$c_warn")
+  fi
+
+  case ${r[sync]} in
+    tracking)
+      if (( r[ahead] && r[behind] ))
+      then
+        sync="${c_err}↓${r[behind]}↑${r[ahead]}${c_off}"
+      elif (( r[behind] ))
+      then
+        sync="${c_warn}↓${r[behind]}${c_off}"
+      elif (( r[ahead] ))
+      then
+        sync="${c_warn}↑${r[ahead]}${c_off}"
+      elif [[ "${r[fetch]}" == failed ]]
+      then
+        sync="${c_warn}≡${c_off}"
+      else
+        sync="${c_ok}≡${c_off}"
+      fi
+      marks+=("$sync")
+      ;;
+    gone)
+      marks+=("${c_err}✗${c_off}")
+      ;;
+    none)
+      marks+=("${c_warn}-${c_off}")
+      ;;
+  esac
+
+  if [[ "${r[status]}" == failed ]]
+  then
+    marks+=("${c_err}(status failed)${c_off}")
+  else
+    (( r[conflicts] )) && marks+=("${c_err}!${r[conflicts]}${c_off}")
+    (( r[staged] ))    && marks+=("${c_warn}+${r[staged]}${c_off}")
+    (( r[unstaged] ))  && marks+=("${c_warn}*${r[unstaged]}${c_off}")
+    (( r[untracked] )) && marks+=("${c_warn}?${r[untracked]}${c_off}")
+  fi
+
+  (( r[stashes] > 0 )) && marks+=("${c_warn}\$${r[stashes]}${c_off}")
+
+  row_statuses+=("${(j: :)marks}")
+}
+
+# Progress
+#
+# The progress line shares the terminal with the results, so it's cleared before anything else is printed and drawn
+# again afterwards.
+
+progress_draw() {
+  local line
+  local -i max
+
+  if (( progress ))
+  then
+    line="→ Checking: ${finished}/${#repos}"
+    # Results are reported in order, so a slow repo holds up those after it. Naming it shows what's being waited on.
+    (( finished < ${#repos} )) && line+=" (${${repos[finished + 1]:a}:t})"
+    # One column is left spare, as some terminals wrap on writing to the last one
+    max="$(( COLUMNS - 1 ))"
+    # Cut to fit, as clearing the line can't clear rows it wrapped onto. Widths are measured in display columns with
+    # (m), so wide characters in a repo name count fully. The trailing space keeps the cursor, which rests at the end
+    # of the line, clear of the ellipsis.
+    if (( ${(m)#line} + 3 <= max ))
+    then
+      line+=" … "
+    else
+      while (( ${#line} && ${(m)#line} + 2 > max ))
+      do
+        line="${line[1,-2]}"
+      done
+      # Below 3 columns, not even the ellipsis fits
+      (( max >= 2 )) && line+="… "
+    fi
+    # Colored after cutting, so the escape sequences don't count toward the width
+    print -u2 -n -r -- $'\r\e[K'"${c_progress}${line}${c_progress_off}"
+  fi
+}
+
+progress_clear() {
+  if (( progress ))
+  then
+    print -u2 -n -- $'\r\e[K'
+  fi
+}
+
+# Jobs
+
+process_tree() {
+  local child
+  print -r -- "$1"
+  for child in $(pgrep -P "$1" || true)
+  do
+    process_tree "$child"
+  done
+}
+
+# Runs on every exit. Background jobs started by a script ignore ^C, as does everything they start, such as a fetch
+# waiting on a slow remote. So any jobs still running are killed here, along with their descendants, as killing just
+# the job would leave those running.
+cleanup() {
+  local pid procs=()
+  for pid in "${pids[@]}"
+  do
+    # Jobs that have been reaped have had their PIDs cleared
+    [[ -n "$pid" ]] || continue
+    procs+=($(process_tree "$pid"))
+  done
+  (( ${#procs} )) && kill "${procs[@]}" &>/dev/null || true
+  rm -rf -- "$tmpdir"
+}
+
+# On ^C, lists the repos still being checked, so a run held up by an unresponsive remote shows which one. This relies
+# on the jobs ignoring ^C, which keeps them alive to be listed.
+interrupted() {
+  local i running=()
+
+  # Run as `git sitrep`, the interrupt arrives twice, once from the terminal and once forwarded by git, so further
+  # interrupts are ignored to report only once
+  trap '' INT
+  # A C-style loop, as {1..0} would expand to 1 0 when no job has started yet
+  for (( i = 1; i <= ${#pids}; i++ ))
+  do
+    # A job that has finished but isn't reaped yet still has a PID, so kill -0 checks it's actually running
+    [[ -n "${pids[i]}" ]] && kill -0 "${pids[i]}" 2>/dev/null && running+=("${repos[i]}")
+  done
+
+  # The terminal echoes ^C onto the progress line, so clearing that line removes it too. Without a progress line, the
+  # report starts on a new line after the ^C instead.
+  if (( progress ))
+  then
+    progress_clear
+  else
+    print -u2
+  fi
+  if (( ${#running} ))
+  then
+    print -u2 -r -- "${prog}: interrupted while checking:"
+    print -u2 -r -l -- "${running[@]/#/  }"
+  else
+    print -u2 -r -- "${prog}: interrupted"
+  fi
+  exit 130
+}
+
+# Waits for the next repo in order, reads its results and reports them. Waiting in order keeps the output in the
+# order the paths were given, however the jobs finish.
+finish_next() {
+  local -A r=()
+  local -i i="$(( ++finished ))"
+
+  wait "${pids[i]}" || exit_code=1
+  pids[i]=
+  source "${tmpdir}/${i}"
+
+  if (( verbose ))
+  then
+    progress_clear
+    render_verbose
+  else
+    render_compact
+  fi
+
+  progress_draw
+}
+
+# Main
+
+tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/${prog}.XXXXXX")"
+
+trap cleanup EXIT
+trap interrupted INT
+# Without a trap, SIGTERM would end the script without running cleanup
+trap 'exit 143' TERM
+
+progress_draw
+
+# Starts a job per repo, with at most max_jobs running. Before starting another, the oldest is waited for.
+for i in {1..${#repos}}
+do
+  while (( i - 1 - finished >= max_jobs ))
+  do
+    finish_next
+  done
+  collect_repo "${repos[i]}" > "${tmpdir}/${i}" &
+  pids[i]="$!"
+done
+
+while (( finished < ${#repos} ))
+do
+  finish_next
+done
+
+progress_clear
+
+if (( ! verbose ))
+then
+  # Column widths are measured in display columns with (m), so wide characters in names still line up
+  typeset -i repo_width=0 branch_width=0
+  for i in {1..${#row_repos}}
+  do
+    (( ${(m)#row_repos[i]} > repo_width ))     && repo_width="${(m)#row_repos[i]}"
+    (( ${(m)#row_branches[i]} > branch_width )) && branch_width="${(m)#row_branches[i]}"
+  done
+
+  # Rows with no branch or no marks leave out those columns, rather than ending in padding
+  for i in {1..${#row_repos}}
+  do
+    if [[ -z "${row_branches[i]}" ]]
+    then
+      print -r -- "${(mr:repo_width:)row_repos[i]}  ${row_statuses[i]}"
+    elif [[ -z "${row_statuses[i]}" ]]
+    then
+      print -r -- "${(mr:repo_width:)row_repos[i]}  ${row_branch_colors[i]}${row_branches[i]}${c_off}"
+    else
+      print -r -- "${(mr:repo_width:)row_repos[i]}  ${row_branch_colors[i]}${(mr:branch_width:)row_branches[i]}${c_off}  ${row_statuses[i]}"
+    fi
+  done
+else
+  # Verbose sections each start with a blank line, so this closes the last one
+  print
+fi
+
+exit "$exit_code"

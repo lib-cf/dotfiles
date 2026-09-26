@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+
+#
+#  All Contributions by Match Group
+#
+#  Copyright © 2025 Tinder (Match Group, LLC)
+#
+#  Licensed under the Match Group Modified 3-Clause BSD License.
+#  See https://github.com/Tinder/Commit-Message-Validation-Hook/blob/main/LICENSE for license information.
+#
+
+COMMIT_MSG=$(cat "$1" | grep -ve '^#')
+
+LINE_1="$(echo "$COMMIT_MSG" | head -1)"
+LINE_2="$(echo "$COMMIT_MSG" | tail -n +2 | head -1)"
+LINE_N="$(echo "$COMMIT_MSG" | tail -n +3)"
+
+match()
+{
+    echo "$1" | grep -e "$2" >/dev/null
+}
+
+match "$LINE_1" '\S' || {
+    echo >&2 "Aborting commit due to empty commit message."
+    exit 1
+}
+
+abort()
+{
+    echo >&2 "Aborting commit due to $1"
+    echo >&2 "-"
+    echo >&2 "$COMMIT_MSG"
+    echo >&2 "-"
+    echo >&2 "To temporarily bypass commit message validation, use \`git commit --no-verify\`."
+    exit 1
+}
+
+match "$LINE_1" '^[[:lower:]]' && \
+    abort "first line of commit message starting with a lowercase letter."
+
+match "$LINE_1" '.*\.\s*$' && \
+    abort "first line of commit message ending with a period."
+
+match "$LINE_1" '^..\{50\}' && \
+    abort "first line of commit message exceeding 50 character limit."
+
+match "$LINE_2" '^$' || \
+    abort "second line of commit message not being empty."
+
+match "$LINE_N" '^..\{72\}' && \
+    abort "line in body of commit message exceeding 72 character limit."
+
+if command -v spellcheck >/dev/null
+then
+    MISSPELLED_WORDS=$(echo "$COMMIT_MSG" | spellcheck)
+    if [ $? -ne 0 ]
+    then
+        NEWLINE=$'\n'
+        abort "misspelled words:${NEWLINE}${MISSPELLED_WORDS}"
+    fi
+fi
